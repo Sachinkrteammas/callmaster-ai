@@ -1,0 +1,10 @@
+{
+  "title": "PLACEHOLDER_AUDIT_SCHEMA",
+  "description": "PLACEHOLDER - replace this whole file with the production audit JSON schema copied exactly from the existing Callmaster/OpenAI implementation. Do not rename, remove or add fields, and do not change types or enums.",
+  "type": "object",
+  "properties": {
+    "placeholder_note": { "type": "string" }
+  },
+  "required": ["placeholder_note"],
+  "additionalProperties": false
+}

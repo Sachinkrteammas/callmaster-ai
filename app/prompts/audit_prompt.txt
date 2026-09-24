@@ -1,0 +1,10 @@
+PLACEHOLDER AUDIT PROMPT
+
+The production audit prompt must be copied from the existing
+Callmaster/OpenAI implementation.
+
+Do not modify the production prompt when it is supplied.
+
+(Until then, for pipeline testing only: read the call transcript and return
+a JSON object with a single field "placeholder_note" containing one short
+English sentence describing the call.)

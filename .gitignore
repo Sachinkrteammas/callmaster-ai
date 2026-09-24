@@ -1,0 +1,17 @@
+.env
+data/audio/*
+data/results/*
+data/logs/*
+data/redis/
+!data/*/.gitkeep
+models/**
+!models/**/
+!models/**/.gitkeep
+*.mp3
+*.wav
+*.m4a
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
