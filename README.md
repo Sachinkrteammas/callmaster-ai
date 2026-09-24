@@ -1,453 +1,405 @@
-# Callmaster AI — Self-Hosted Speech-to-Text + Audit Service
+# Callmaster AI — Self-Hosted Speech-to-Text + Audit Service (no Docker)
 
-A standalone service that replaces **Deepgram** and **OpenAI** for Callmaster audits.
-It does NOT change Callmaster. Callmaster will call this service later.
+Replaces **Deepgram** and **OpenAI** for Callmaster audits. Runs directly on one
+Ubuntu GPU server as normal programs. Callmaster itself is **not** changed.
 
 ```
 Audio (.wav/.mp3/.m4a)
-   ↓  FFmpeg (split stereo: channel 1 = Agent, channel 2 = Customer)
-   ↓  faster-whisper  large-v3-turbo  (GPU)
-Timestamped transcript  "[0.00s] Agent: Sir good morning sir."
-   ↓  + EXISTING audit prompt (app/prompts/audit_prompt.txt)
-   ↓  Qwen2.5-7B-Instruct-AWQ on vLLM  (GPU, local)
-Audit JSON  (validated against app/schemas/audit_schema.json)
+   ↓  FFmpeg  (stereo: channel 1 = Agent, channel 2 = Customer)
+   ↓  faster-whisper large-v3-turbo  (GPU)
+Transcript   "[0.00s] Agent: Sir good morning sir."
+   ↓  + EXISTING audit prompt  (app/prompts/audit_prompt.txt)
+   ↓  Qwen2.5-7B-Instruct-AWQ on vLLM  (GPU, on this server)
+Audit JSON   (checked against app/schemas/audit_schema.json)
 ```
 
-There is **no audit logic in Python**. The audit prompt is the business logic;
-Qwen executes it. Python only moves data and checks the JSON format.
+There is **no audit logic in Python**. The audit prompt is the business logic; Qwen runs it.
 
----
+## 1. The 4 programs
 
-## 1. What this project does
+| # | Program | What it does | How it runs |
+|---|---|---|---|
+| 1 | **Redis** | Job queue | Ubuntu service, starts automatically |
+| 2 | **vLLM** | Runs Qwen (the LLM) on the GPU, port 8000, only reachable from the server itself | `scripts/start_vllm.sh` (terminal 1) |
+| 3 | **Worker** | Loads Whisper once, transcribes audio, sends transcript + prompt to Qwen | `scripts/start_worker.sh` (terminal 2) |
+| 4 | **API** | FastAPI on port 8080 — what Callmaster will call | `scripts/start_api.sh` (terminal 3) |
+
+Start order is always: **Redis → vLLM (wait until ready) → Worker → API**.
 
 | Endpoint | What it does |
 |---|---|
-| `GET /health` | Is everything running? (public, no key) |
-| `POST /v1/transcribe` | Audio → transcript only |
-| `POST /v1/audit` | Transcript (text) → audit JSON only |
-| `POST /v1/process` | Audio → transcript → audit JSON (waits for the result) |
-| `POST /v1/jobs` | Same as process, but returns immediately (background job, 3 retries: 30/60/120 s) |
-| `GET /v1/jobs/{call_id}` | Status/result of a background job: `queued`, `processing`, `completed`, `failed` |
+| `GET /health` | Is everything running? (no key needed) |
+| `POST /v1/transcribe` | Audio → transcript |
+| `POST /v1/audit` | Transcript text → audit JSON |
+| `POST /v1/process` | Audio → transcript → audit JSON (waits for result) |
+| `POST /v1/jobs` | Same, but returns immediately; 3 retries after 30/60/120 s |
+| `GET /v1/jobs/{call_id}` | `queued` / `processing` / `completed` / `failed` + result |
 
 All `/v1/*` endpoints need the header `X-API-Key`.
 
-## 2. Architecture
+## 2. Server requirements
 
-Four Docker containers, all on one GPU server:
+| Item | Minimum |
+|---|---|
+| GPU | NVIDIA, 24 GB VRAM (L4, A10, RTX 3090/4090, A5000 …) |
+| NVIDIA driver | 550 or newer |
+| CPU / RAM | 8 cores / 32 GB (64 GB better) |
+| Disk | 100 GB free minimum (software + models ≈ 25 GB) + audio |
+| OS | Ubuntu 22.04 or 24.04, with `sudo` |
 
-| Container | Job | Uses GPU |
-|---|---|---|
-| `redis` | Job queue (jobs survive restarts) | No |
-| `vllm` | Runs the Qwen LLM, OpenAI-compatible API on port 8000 (internal only) | Yes (~55%) |
-| `worker` | Loads Whisper once, does FFmpeg + transcription + calls vLLM | Yes |
-| `api` | FastAPI on port 8080 — the only thing reachable from outside | No |
-
-Only one Whisper model is ever in GPU memory (in the worker). `/v1/transcribe`
-and `/v1/process` hand the work to the worker and wait for it.
-
-## 3. Requirements
-
-| Item | Minimum | Preferred |
-|---|---|---|
-| GPU | NVIDIA with 24 GB VRAM (e.g. L4, A10, RTX 4090/3090, A5000) | same |
-| NVIDIA driver | 550 or newer (supports CUDA 12.4) | latest |
-| CPU | 8 cores | more |
-| RAM | 32 GB | 64 GB |
-| Disk | 100 GB free (images + models ≈ 25 GB) + audio | 500 GB NVMe |
-| OS | Ubuntu 22.04 or 24.04 | 22.04 |
-| Access | SSH login with `sudo` | |
-
-> **Beginner note — choosing a GPU server.** You need a *virtual machine* (VM) or
-> a physical server where you get full Ubuntu with `sudo`. Cloud "GPU pods" that
-> are themselves Docker containers (for example many RunPod/Vast "pods") usually
-> **cannot run Docker inside**, so this setup will not work on them.
-> Good options: AWS `g6.xlarge` (L4) / `g5.xlarge` (A10G), Google Cloud `g2-standard-8` (L4),
-> Azure NV-series, or Indian providers such as E2E Networks (keeps data in India).
-> Choose an **Ubuntu 22.04** image. Many cloud "Deep Learning" images already
-> include the NVIDIA driver and Docker — you can then skip steps 4.1–5.2.
+Rent a normal **virtual machine** (AWS g6/g5, Google Cloud L4, Azure, E2E Networks…)
+with **Ubuntu 22.04**. A "Deep Learning" image with the NVIDIA driver pre-installed saves a step.
 
 ---
 
-## STEP-BY-STEP DEPLOYMENT (do these in order)
+# STEP-BY-STEP SETUP
 
-Each step ends with a ✅ **Check**. Do not continue until the check passes.
+Do the steps in order. Each ends with ✅ **Check** — only continue when it passes.
+If something fails, copy the full error message and ask for help.
 
-### Step 0 — Connect to the server
+## Step 1 — Connect to the server
 
-From your laptop (Windows PowerShell, Mac or Linux terminal):
+On your laptop (Windows PowerShell, Mac/Linux terminal):
 
 ```bash
-ssh ubuntu@YOUR_SERVER_IP          # user may be "ubuntu", "root" etc. — your provider tells you
+ssh ubuntu@YOUR_SERVER_IP
+# with a key file:  ssh -i mykey.pem ubuntu@YOUR_SERVER_IP
 ```
 
-If you were given a key file: `ssh -i path/to/key.pem ubuntu@YOUR_SERVER_IP`
+✅ **Check:** prompt looks like `ubuntu@servername:~$`. All commands below are typed on the server.
 
-✅ **Check:** the prompt changes to something like `ubuntu@gpu-server:~$`.
-Every command below is typed **on the server**, unless it says "on your laptop".
-
-### Step 1 — Update the server
+## Step 2 — Install basic software
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y git curl ca-certificates
+sudo apt install -y git unzip curl tmux ffmpeg redis-server python3-venv python3-pip python3-dev
+sudo systemctl enable --now redis-server
 ```
 
-## 4. NVIDIA setup
+✅ **Check:**
+```bash
+ffmpeg -version | head -1      # prints "ffmpeg version ..."
+redis-cli ping                 # prints PONG
+python3 --version              # 3.10 or 3.12
+```
 
-### 4.1 Is the GPU driver already installed?
+## Step 3 — NVIDIA driver
 
 ```bash
 nvidia-smi
 ```
 
-- If you see a table with your GPU name, memory (e.g. `23034MiB`) and
-  `Driver Version: 550.xx` or higher → **driver is fine, go to 5.1**.
-- If you see `command not found` → install the driver:
+- A table with your GPU name and **Driver Version 550 or higher** → go to Step 4.
+- `command not found` (or driver lower than 550):
 
 ```bash
 sudo ubuntu-drivers install
 sudo reboot
 ```
+Wait 2 minutes, `ssh` in again, run `nvidia-smi` again.
 
-Wait 1–2 minutes, `ssh` in again and run `nvidia-smi` again.
+✅ **Check:** `nvidia-smi` shows the GPU, e.g. `NVIDIA L4 ... 23034MiB`.
 
-✅ **Check:** `nvidia-smi` shows your GPU, and "CUDA Version" in the top-right is **12.4 or higher**.
+## Step 4 — Put the project on the server
 
-## 5. Docker setup
-
-### 5.1 Install Docker
-
-```bash
-docker --version || curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker $USER
-exit
-```
-
-`ssh` in again (this activates the group change), then:
-
-```bash
-docker run --rm hello-world
-docker compose version
-```
-
-✅ **Check:** "Hello from Docker!" and a Compose version (v2.x) are printed.
-
-### 5.2 Let Docker use the GPU (NVIDIA Container Toolkit)
-
-```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt update && sudo apt install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-✅ **Check (most important check of all):**
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
-```
-
-You must see the same GPU table as in 4.1. If you get an error, see
-**section 16 (GPU troubleshooting)** before going further.
-
-## 6. Installation (get the code onto the server)
-
-**Option A — through Git (recommended):** see section 19 to push the project
-to GitHub/GitLab from your laptop first, then on the server:
-
-```bash
-cd ~
-git clone https://github.com/YOUR_ORG/callmaster-ai.git
-cd callmaster-ai
-```
-
-For a private repository GitHub will ask for a username and a **Personal Access
-Token** (not your password): GitHub → Settings → Developer settings → Personal access tokens.
-
-**Option B — copy the zip file (quickest first time).** On your laptop:
-
+**Option A — zip file (easiest).** On your laptop:
 ```bash
 scp callmaster-ai.zip ubuntu@YOUR_SERVER_IP:~
 ```
-
 On the server:
-
 ```bash
-sudo apt install -y unzip && unzip callmaster-ai.zip && cd callmaster-ai
+cd ~ && unzip callmaster-ai.zip && cd callmaster-ai
 ```
 
-✅ **Check:** `ls` shows `README.md  app  docker-compose.yml  tests  worker ...`
+**Option B — Git** (after pushing it, see Step 17):
+```bash
+cd ~ && git clone https://github.com/YOUR_ORG/callmaster-ai.git && cd callmaster-ai
+```
 
-## 7. Environment variables
+✅ **Check:** `ls` shows `README.md  app  scripts  tests  worker ...`
+
+## Step 5 — Settings file (.env)
 
 ```bash
 cp .env.example .env
-openssl rand -hex 32          # copy the long random text this prints
-nano .env                     # paste it after API_KEY=   then Ctrl+O, Enter, Ctrl+X
+openssl rand -hex 32        # prints a long random key - copy it
+nano .env                   # paste it after API_KEY=
+```
+Save in nano: **Ctrl+O**, **Enter**, **Ctrl+X**.
+
+Main settings (defaults are fine to start):
+
+| Setting | Meaning |
+|---|---|
+| `API_KEY` | Password callers must send as `X-API-Key` — **must change** |
+| `STT_LANGUAGE=auto` | Detect Hindi/English automatically. Don't force `en`. |
+| `CHANNEL_1_SPEAKER` / `CHANNEL_2_SPEAKER` | Agent/Customer per stereo channel (swap if reversed) |
+| `VOCAB` | Company/product/campaign names, comma separated, one line |
+| `VLLM_GPU_MEMORY_UTILIZATION` | Share of GPU for Qwen (0.55 leaves room for Whisper) |
+| `VLLM_MAX_MODEL_LEN` | Max transcript + prompt + answer length for Qwen |
+
+`.env` is never uploaded to Git.
+
+## Step 6 — Install Python packages (two separate environments)
+
+vLLM and Whisper need different CUDA packages, so each gets its own folder.
+This downloads several GB and can take 10–20 minutes.
+
+**6a. App environment (Whisper + API):**
+```bash
+cd ~/callmaster-ai
+python3 -m venv .venv-app
+.venv-app/bin/pip install --upgrade pip
+.venv-app/bin/pip install -r app/requirements.txt -r requirements-gpu.txt
 ```
 
-Important variables:
+✅ **Check:**
+```bash
+source scripts/env.sh app
+python -c "import ctranslate2; print('GPUs seen by Whisper:', ctranslate2.get_cuda_device_count())"
+deactivate
+```
+Must print `GPUs seen by Whisper: 1`.
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `API_KEY` | Password Callmaster must send in `X-API-Key` | must change |
-| `STT_MODEL` | Whisper model | `large-v3-turbo` |
-| `STT_LANGUAGE` | `auto` = detect Hindi/English. Do not force `en`. | `auto` |
-| `STT_BEAM_SIZE` / `STT_BEST_OF` | Accuracy vs speed | `5` / `5` |
-| `STT_VAD_FILTER` | Skip silence | `true` |
-| `STT_CONDITION_ON_PREVIOUS_TEXT` | `false` reduces Whisper repeat-loops | `false` |
-| `CHANNEL_1_SPEAKER` / `CHANNEL_2_SPEAKER` | Who is on which stereo channel | `Agent` / `Customer` |
-| `VOCAB` | Comma-separated domain words (company, product, campaign names) | empty |
-| `LLM_MODEL` | Model served by vLLM | `Qwen/Qwen2.5-7B-Instruct-AWQ` |
-| `VLLM_GPU_MEMORY_UTILIZATION` | Share of GPU memory for vLLM | `0.55` |
-| `VLLM_MAX_MODEL_LEN` | Max prompt + answer length (tokens) | `16384` |
-| `API_BIND` | Network address the API listens on | `0.0.0.0` |
+**6b. vLLM environment (Qwen):**
+```bash
+python3 -m venv .venv-vllm
+.venv-vllm/bin/pip install --upgrade pip
+.venv-vllm/bin/pip install -r requirements-vllm.txt
+```
 
-`.env` is in `.gitignore` — it is never committed.
+✅ **Check:**
+```bash
+.venv-vllm/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+Must print `True NVIDIA ...`.
 
-## 8. Prompt replacement  (do this before real testing)
+## Step 7 — Put in the real audit prompt and schema
 
-Copy the **production** audit prompt from the existing Callmaster/OpenAI code,
-exactly as it is, into `app/prompts/audit_prompt.txt` (replace the whole file):
-
+**Prompt:** copy the production audit prompt from the current Callmaster/OpenAI code,
+exactly as it is, into `app/prompts/audit_prompt.txt` (replace everything):
 ```bash
 nano app/prompts/audit_prompt.txt
 ```
+- Default: prompt is sent as the **system** message, transcript as the **user** message.
+- If Callmaster today puts the transcript **inside** the prompt, write `{{TRANSCRIPT}}`
+  at that place in the prompt. Match what Callmaster does today.
 
-How it is sent to Qwen:
-- Default: the prompt is the **system** message and the transcript is the **user** message.
-- If Callmaster today puts the transcript **inside** the prompt text, put the
-  marker `{{TRANSCRIPT}}` where the transcript goes; the whole prompt is then sent
-  as one user message. Match whatever Callmaster does today.
-- Our transcript has timestamps and speaker labels (`[2.10s] Customer: Hello.`).
-  Deepgram's text may have looked different; that is fine, but keep it in mind
-  when comparing results.
-
-The file is re-read for every call — no restart or rebuild needed.
-
-## 9. Schema replacement
-
-Copy the production audit JSON **schema** into `app/schemas/audit_schema.json`.
-Do not rename, remove or add fields; do not change types or enums.
-
-If Callmaster does **not** have a formal JSON Schema today (for example it used
-OpenAI "JSON mode" and the prompt just describes the fields), the schema must be
-written from real production outputs and then checked by the person who owns the
-audit. You can check that the file is a valid schema with:
-
+**Schema:** copy the production JSON schema into `app/schemas/audit_schema.json`.
+Do not rename/add/remove fields or change types/enums. If Callmaster has no formal
+schema (e.g. it used OpenAI "JSON mode"), one must be written from real outputs and
+approved by the audit owner. Check the file:
 ```bash
-docker compose run --rm api python3 -c "from app.audit import load_schema; load_schema(); print('schema OK')"
+source scripts/env.sh app
+python -c "from app.audit import load_schema; load_schema(); print('schema OK')"
 ```
 
-`/health` shows `"prompt_is_placeholder": false` and `"schema_is_placeholder": false`
-once both real files are in place.
+You can do the first technical test with the placeholders, but the real audit
+needs these two files. Changes take effect on the next call — no restart needed.
 
-## 10. Start the service
+## Step 8 — Learn tmux (keeps programs running after you close SSH)
 
-```bash
-docker compose config        # checks the compose file + .env; prints the full config, no errors
-docker compose build         # builds the app image (5–15 min the first time)
-docker compose up -d         # starts everything in the background
-docker compose logs -f vllm  # watch the LLM start
-```
+| Action | Keys / command |
+|---|---|
+| Open a new named window | `tmux new -s NAME` |
+| Leave it running in background | press **Ctrl+B**, release, then press **D** |
+| Go back to it | `tmux attach -t NAME` |
+| List them | `tmux ls` |
+| Stop the program inside | **Ctrl+C** |
 
-The **first start downloads models**: Qwen ≈ 5.5 GB, Whisper ≈ 1.6 GB, vLLM image ≈ 10 GB.
-This can take 10–30 minutes. Wait until the vllm log shows
-`Application startup complete`. Press **Ctrl+C** to stop watching (the service keeps running).
-
-The worker waits for vLLM to be healthy before loading Whisper (so the GPU memory
-is shared correctly). Then:
+## Step 9 — Start vLLM (Qwen) — FIRST
 
 ```bash
-docker compose logs -f worker   # wait for "Worker ready: STT=large-v3-turbo ..."
-docker compose ps               # all 4 services "running" / vllm "healthy"
+cd ~/callmaster-ai
+tmux new -s vllm
+./scripts/start_vllm.sh
 ```
+The first time it downloads Qwen (~5.5 GB) into `models/hf/`. Wait until you see:
+**`Application startup complete`**. Then press **Ctrl+B, D**.
 
-## 11. Check health
+✅ **Check:**
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+Shows `Qwen/Qwen2.5-7B-Instruct-AWQ`.
+
+## Step 10 — Start the Worker (Whisper)
+
+```bash
+cd ~/callmaster-ai
+tmux new -s worker
+./scripts/start_worker.sh
+```
+First time downloads Whisper (~1.6 GB) into `models/whisper/`. Wait for:
+**`Worker ready: STT=large-v3-turbo ...`**. Then **Ctrl+B, D**.
+
+✅ **Check:** `nvidia-smi` shows two processes using GPU memory (vLLM and python).
+
+## Step 11 — Start the API
+
+```bash
+cd ~/callmaster-ai
+tmux new -s api
+./scripts/start_api.sh
+```
+Wait for `Uvicorn running on http://0.0.0.0:8080`. Then **Ctrl+B, D**.
+
+## Step 12 — Health check
 
 ```bash
 curl http://localhost:8080/health
 ```
 
 ✅ **Check:** `"status":"ok"` and `"checks":{"redis":true,"stt":true,"llm":true}`.
+If one is `false`, that program is not running — see Step 16.
 
-Make your API key easy to use in the next commands:
-
+Save your key in the terminal for the next steps:
 ```bash
+cd ~/callmaster-ai
 export API_KEY=$(grep ^API_KEY= .env | cut -d= -f2)
 ```
 
-## 12. Test transcription
+## Step 13 — Test with a real recording
 
-Copy a real recording to the server (on your laptop):
-`scp sample_call.mp3 ubuntu@YOUR_SERVER_IP:~/callmaster-ai/data/audio/`
-
+Copy a real call to the server (on your laptop):
 ```bash
-curl -X POST http://localhost:8080/v1/transcribe \
-  -H "X-API-Key: $API_KEY" \
-  -F "call_id=TEST001" \
-  -F "file=@data/audio/sample_call.mp3"
+scp sample_call.mp3 ubuntu@YOUR_SERVER_IP:~/callmaster-ai/data/audio/
 ```
 
-Or print full details (duration, channels, sample rate, language, transcript):
-
+**13a. Transcript only:**
 ```bash
-docker compose exec worker python3 scripts/test_audio.py /data/audio/sample_call.mp3
+curl -X POST http://localhost:8080/v1/transcribe -H "X-API-Key: $API_KEY" \
+  -F "call_id=TEST001" -F "file=@data/audio/sample_call.mp3"
+```
+
+**13b. Detailed view** (duration, channels, sample rate, language, transcript):
+```bash
+source scripts/env.sh app
+python scripts/test_audio.py data/audio/sample_call.mp3
+deactivate
 ```
 
 ✅ **Check:**
-- Transcript is readable; Hindi appears where Hindi is spoken, English where English is spoken.
-- On a stereo call, lines marked `Agent` really are the agent. **If they are reversed**,
-  swap `CHANNEL_1_SPEAKER` / `CHANNEL_2_SPEAKER` in `.env`, then `docker compose up -d`.
-- If Agent and Customer lines are **identical duplicates**, the dialer is writing the
-  same mixed audio to both channels (fake stereo). Ask for true two-channel recordings.
+- Hindi appears where Hindi is spoken, English where English is spoken.
+- On stereo calls, `Agent` lines really are the agent. **If reversed:** swap
+  `CHANNEL_1_SPEAKER` and `CHANNEL_2_SPEAKER` in `.env`, then restart the worker
+  and API (Step 15).
+- If Agent and Customer lines are **exact duplicates**, the dialer writes the same
+  mixed audio to both channels — ask for true two-channel recordings.
 
-## 13. Test audit
-
+**13c. Audit only:**
 ```bash
-curl -X POST http://localhost:8080/v1/audit \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+curl -X POST http://localhost:8080/v1/audit -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
   -d '{"call_id":"TEST001","transcript":"[0.00s] Agent: Sir good morning sir.\n[2.00s] Customer: Hello."}'
 ```
 
-✅ **Check:** `"success": true` and an `audit` object matching your schema.
-
-## 14. Test full pipeline
-
-Wait for the result:
-
+**13d. Full pipeline:**
 ```bash
-curl -X POST http://localhost:8080/v1/process \
-  -H "X-API-Key: $API_KEY" \
-  -F "call_id=TEST002" \
-  -F "file=@data/audio/sample_call.mp3"
+curl -X POST http://localhost:8080/v1/process -H "X-API-Key: $API_KEY" \
+  -F "call_id=TEST002" -F "file=@data/audio/sample_call.mp3"
 ```
 
-Background job (how Callmaster should use it in production):
-
+**13e. Background job** (how Callmaster should use it later):
 ```bash
 curl -X POST http://localhost:8080/v1/jobs -H "X-API-Key: $API_KEY" \
-  -F "call_id=TEST003" -F "file=@data/audio/sample_call.mp3" \
-  -F "webhook_url=https://callmaster.internal/ai-callback"      # optional
-
+  -F "call_id=TEST003" -F "file=@data/audio/sample_call.mp3"
 curl http://localhost:8080/v1/jobs/TEST003 -H "X-API-Key: $API_KEY"
 ```
+Optional `-F "webhook_url=https://..."`: if the webhook fails, the result is still
+saved and not re-processed. Every result is also saved in `data/results/<call_id>.json`.
 
-Results are also saved as files: `data/results/<call_id>.json`.
+## Step 14 — Tests and benchmark
 
-If the webhook fails, the result is still saved and the job stays `completed`
-(the AI work is not repeated); the error is in the logs and in `result.webhook`.
-
-### GPU integration tests
-
+Unit tests (no GPU needed):
 ```bash
-docker compose exec -e RUN_GPU_TESTS=1 -e API_URL=http://api:8080 -e SAMPLE_AUDIO=/data/audio/sample_call.mp3 \
-  worker sh -c "pip3 install -q pytest && python3 -m pytest tests/integration -v -s"
-```
-
-## 15. Check logs
-
-```bash
-docker compose logs -f api
-docker compose logs -f worker
-docker compose logs -f vllm
-ls data/logs/            # api.log, worker.log
-watch -n 2 nvidia-smi    # live GPU memory/usage (Ctrl+C to exit)
-```
-
-Logs include call_id, audio duration, channels, STT/LLM start and end, total time and errors.
-API keys are never logged; full transcripts are only logged when `LOG_LEVEL=DEBUG`.
-
-Other everyday commands:
-
-```bash
-docker compose ps           # what is running
-docker compose restart      # restart all
-docker compose down         # stop all
-docker compose up -d --build   # after changing code or .env
-```
-
-## 16. GPU troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `nvidia-smi: command not found` | `sudo ubuntu-drivers install && sudo reboot` |
-| `could not select device driver "" with capabilities: [[gpu]]` | NVIDIA Container Toolkit missing/not configured → redo step 5.2, then `sudo systemctl restart docker` |
-| `docker: permission denied` | You skipped `usermod -aG docker $USER`, or didn't log out/in |
-| vLLM: `CUDA out of memory` or "not enough KV cache" | Lower `VLLM_MAX_MODEL_LEN` (e.g. 8192) or change `VLLM_GPU_MEMORY_UTILIZATION`; make sure nothing else uses the GPU (`nvidia-smi`) |
-| worker: `CUDA out of memory` | Lower `VLLM_GPU_MEMORY_UTILIZATION` (e.g. 0.50) so Whisper has room |
-| worker: `libcudnn_ops.so.9 ... cannot open` | The image's cuDNN doesn't match; keep the Dockerfile base image and `ctranslate2==4.5.0` as pinned |
-| `CUDA driver version is insufficient` | Driver too old for CUDA 12.4 → install driver ≥ 550 |
-| vLLM `unhealthy` for a long time | First download is big; check `docker compose logs vllm`. Healthcheck allows 15 min |
-| LLM output "cut off" error | Increase `LLM_MAX_TOKENS` and/or `VLLM_MAX_MODEL_LEN` |
-| vLLM rejects the schema (guided decoding error) | Some JSON Schema features aren't supported; set `LLM_GUIDED_JSON=false` (output is still validated) |
-| Very long calls fail in the LLM | Transcript is longer than `VLLM_MAX_MODEL_LEN`; raise it if GPU memory allows |
-
-## 17. Model information
-
-| | Speech-to-text | Audit LLM |
-|---|---|---|
-| Model | Whisper large-v3-turbo (OpenAI weights, MIT) | Qwen2.5-7B-Instruct-AWQ (Apache 2.0) |
-| Runtime | faster-whisper / CTranslate2, float16 | vLLM, 4-bit AWQ |
-| GPU memory | ≈ 3–4 GB | ≈ 55% of the GPU (set by `VLLM_GPU_MEMORY_UTILIZATION`) |
-| Stored in | `models/whisper/` | `models/hf/` |
-| Languages | Auto-detected; handles Hindi, English, mixed | Multilingual |
-
-Models are downloaded once and reused. Internet is needed only for the first start.
-
-## 18. Performance benchmark
-
-Put a few real recordings in `data/audio/`, then:
-
-```bash
-docker compose exec -e API_URL=http://api:8080 worker \
-  python3 tests/benchmark.py /data/audio/call1.mp3 /data/audio/call2.mp3
-```
-
-Prints measured audio duration, STT time, LLM time, total and real-time factor (RTF).
-Nothing is assumed — run it on 20–50 real calls before deciding capacity.
-
-## Unit tests (no GPU needed — run on your laptop or the server)
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
+source scripts/env.sh app
 pip install -r requirements-dev.txt
 pytest
 ```
 
-Whisper, vLLM and Redis are replaced by fakes; FFmpeg tests run if FFmpeg is installed.
+GPU tests against the running service:
+```bash
+RUN_GPU_TESTS=1 SAMPLE_AUDIO=data/audio/sample_call.mp3 pytest tests/integration -v -s
+```
 
-## 19. Git deployment
+Benchmark (measured numbers only):
+```bash
+python tests/benchmark.py data/audio/call1.mp3 data/audio/call2.mp3
+```
+Prints audio duration, STT time, LLM time, total, real-time factor. Run on 20–50 real calls.
 
-The project already contains a first commit. To put it on GitHub/GitLab (on your laptop):
+## Step 15 — Daily operations
 
-1. Create an **empty private** repository on GitHub/GitLab (no README).
-2. In the project folder:
+| Task | Command |
+|---|---|
+| See running programs | `tmux ls` |
+| Watch a program's output | `tmux attach -t worker` (then Ctrl+B, D to leave) |
+| Log files | `tail -f data/logs/worker.log` / `data/logs/api.log` |
+| GPU usage | `watch -n 2 nvidia-smi` (Ctrl+C to exit) |
+| Restart worker after `.env` change | `tmux attach -t worker` → Ctrl+C → `./scripts/start_worker.sh` → Ctrl+B, D |
+| Restart API after `.env` change | same with `-t api` and `./scripts/start_api.sh` |
+| After a server reboot | Start Steps 9 → 10 → 11 again (Redis starts by itself) |
 
+Logs contain call_id, audio duration, channels, STT/LLM start/end, total time and
+errors — never API keys; full transcripts only if `LOG_LEVEL=DEBUG`.
+
+Automatic start on reboot (systemd services) can be added once everything works.
+
+## Step 16 — Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `health` → `redis: false` | `sudo systemctl restart redis-server`, check `redis-cli ping` |
+| `health` → `llm: false` | vLLM not running/ready: `tmux attach -t vllm` and read the error |
+| `health` → `stt: false` | Worker not running: `tmux attach -t worker` |
+| `ERROR: .env not found` | Step 5 |
+| `ERROR: .venv-app not found` | Step 6 |
+| Worker: `libcudnn_ops.so.9` / `libcublas` not found | Always start with `./scripts/start_worker.sh` (it sets the library path). Re-run Step 6a |
+| `GPUs seen by Whisper: 0` | Driver problem → `nvidia-smi`, Step 3 |
+| vLLM: `CUDA out of memory` / "no available memory for cache" | Stop the worker, start vLLM first, then the worker. Or lower `VLLM_MAX_MODEL_LEN` to 8192 |
+| Worker: `CUDA out of memory` | Lower `VLLM_GPU_MEMORY_UTILIZATION` to 0.50, restart vLLM then worker |
+| `torch.cuda.is_available()` → False | Driver older than 550 → Step 3 |
+| "LLM output was cut off" | Raise `LLM_MAX_TOKENS` and/or `VLLM_MAX_MODEL_LEN` |
+| vLLM error about the JSON schema | Set `LLM_GUIDED_JSON=false` in `.env` (output is still validated), restart worker + API |
+| `Address already in use` | That program is already running: `tmux ls` |
+
+**Security:**
+- Port 8000 (vLLM) listens only on 127.0.0.1 — not reachable from outside.
+- Allow port 8080 only from the Callmaster server:
+  ```bash
+  sudo ufw allow OpenSSH
+  sudo ufw allow from CALLMASTER_SERVER_IP to any port 8080
+  sudo ufw enable
+  ```
+  (Allow OpenSSH **first**, or you will lock yourself out.) Also check your cloud firewall/security group.
+- Delete old audio daily (`crontab -e`):
+  `0 2 * * * find /home/ubuntu/callmaster-ai/data/audio -type f -mtime +30 -delete`
+
+## Step 17 — Git
+
+The project already has a first commit. To put it on GitHub (on your laptop, inside the project folder):
+1. Create an **empty private** repo on GitHub (no README).
+2. Run:
 ```bash
 git remote add origin https://github.com/YOUR_ORG/callmaster-ai.git
 git push -u origin main
 ```
+Updating the server later: `cd ~/callmaster-ai && git pull`, then restart worker and API (Step 15).
+`.env`, audio, results, models and `.venv*` folders are never committed.
 
-Later updates: change code on the laptop → `git commit -am "message"` → `git push`;
-on the server → `cd ~/callmaster-ai && git pull && docker compose up -d --build`.
-`.env`, audio, results and models are never committed.
+## Models
 
-## Security checklist
+| | Speech-to-text | Audit LLM |
+|---|---|---|
+| Model | Whisper large-v3-turbo (MIT) | Qwen2.5-7B-Instruct-AWQ (Apache 2.0) |
+| Engine | faster-whisper, float16 | vLLM 0.8.5, 4-bit AWQ, guided JSON |
+| GPU memory | ≈ 3–4 GB | ≈ 55% of GPU (setting) |
+| Folder | `models/whisper/` | `models/hf/` |
 
-- Change `API_KEY`. Never commit `.env`.
-- Port 8000 (vLLM) is not published; only 8080 is.
-- **Docker bypasses `ufw` firewall rules for published ports.** To restrict 8080,
-  either set `API_BIND` in `.env` to the server's private IP, or use your cloud
-  provider's security group / firewall to allow 8080 only from the Callmaster server.
-- Delete old audio regularly, e.g. daily cron (`crontab -e`):
-  `0 2 * * * find /home/ubuntu/callmaster-ai/data/audio -type f -mtime +30 -delete`
+Internet is needed only for installing and the first model download.
 
-## Future Callmaster integration (NOT done in this phase)
+## Later: Callmaster integration (not part of this phase)
 
-Callmaster will later call `POST /v1/jobs` (or `/v1/process`) with `call_id`,
-the audio file and a `webhook_url`, and receive `transcript` + `audit` (same audit
-JSON structure as today). Callmaster itself is not modified by this project.
+Callmaster will call `POST /v1/jobs` (or `/v1/process`) with `call_id`, audio and
+`webhook_url`, and receive `transcript` + `audit` with the same audit JSON structure as today.

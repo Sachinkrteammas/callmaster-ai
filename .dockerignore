@@ -1,9 +1,0 @@
-.env
-.git
-data
-models
-**/__pycache__
-.pytest_cache
-*.mp3
-*.wav
-*.m4a

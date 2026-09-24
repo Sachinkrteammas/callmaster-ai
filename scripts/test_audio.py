@@ -1,7 +1,8 @@
 """Transcribe ONE real recording directly with Whisper and print the details.
 
-Run inside the worker container (it has the GPU and FFmpeg):
-    docker compose exec worker python3 scripts/test_audio.py /data/audio/sample.mp3
+Run on the GPU server:
+    source scripts/env.sh app
+    python scripts/test_audio.py data/audio/sample.mp3
 
 Note: this loads a second copy of Whisper for the test (~3 GB GPU memory).
 """

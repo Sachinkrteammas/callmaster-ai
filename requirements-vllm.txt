@@ -1,0 +1,3 @@
+# vLLM runs in its OWN virtual environment (.venv-vllm) so its PyTorch/CUDA
+# packages never conflict with faster-whisper.
+vllm==0.8.5

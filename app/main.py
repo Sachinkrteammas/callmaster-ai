@@ -1,6 +1,6 @@
 """FastAPI service.
 
-GPU work (Whisper) only happens in the worker container, so there is exactly
+GPU work (Whisper) only happens in the worker process, so there is exactly
 one Whisper model in GPU memory. /v1/transcribe and /v1/process put a job on
 the queue and wait for it; /v1/jobs returns immediately (async).
 /v1/audit talks to vLLM directly (no Whisper needed).

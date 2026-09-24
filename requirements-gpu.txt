@@ -1,0 +1,4 @@
+# CUDA libraries needed by faster-whisper on the GPU server (Linux only).
+# No system CUDA install needed - these pip packages provide them.
+nvidia-cublas-cu12==12.4.5.8
+nvidia-cudnn-cu12==9.1.0.70

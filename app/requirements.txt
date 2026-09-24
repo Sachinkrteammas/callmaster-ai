@@ -8,3 +8,4 @@ redis==5.2.1
 rq==1.16.2
 jsonschema==4.23.0
 requests==2.32.3
+python-dotenv==1.0.1
