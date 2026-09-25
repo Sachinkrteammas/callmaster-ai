@@ -198,20 +198,33 @@ def transcribe(call_id: str = Form(...), file: UploadFile = File(...), queue: Qu
 class AuditRequest(BaseModel):
     call_id: str
     transcript: str
+    prompt: Optional[str] = None  # empty = use app/prompts/audit_prompt.txt
+
+
+def _audit(call_id: str, transcript: str, prompt: Optional[str], llm: LLMClient):
+    _check_call_id(call_id)
+    t0 = time.time()
+    try:
+        result = audit_module.run_audit(transcript, call_id=call_id, llm=llm, prompt=prompt)
+    except audit_module.AuditError as exc:
+        return JSONResponse(status_code=422, content={"success": False, "call_id": call_id, "error": str(exc)})
+    except LLMError as exc:
+        return JSONResponse(status_code=502, content={"success": False, "call_id": call_id, "error": str(exc)})
+    return {"success": True, "call_id": call_id, "audit": result,
+            "llm_model": settings.llm_model, "processing_seconds": round(time.time() - t0, 2)}
 
 
 @app.post("/v1/audit", dependencies=[Depends(require_api_key)])
 def audit_endpoint(body: AuditRequest, llm: LLMClient = Depends(get_llm_client)):
-    _check_call_id(body.call_id)
-    t0 = time.time()
-    try:
-        result = audit_module.run_audit(body.transcript, call_id=body.call_id, llm=llm)
-    except audit_module.AuditError as exc:
-        return JSONResponse(status_code=422, content={"success": False, "call_id": body.call_id, "error": str(exc)})
-    except LLMError as exc:
-        return JSONResponse(status_code=502, content={"success": False, "call_id": body.call_id, "error": str(exc)})
-    return {"success": True, "call_id": body.call_id, "audit": result,
-            "llm_model": settings.llm_model, "processing_seconds": round(time.time() - t0, 2)}
+    """JSON body: call_id, transcript, optional prompt."""
+    return _audit(body.call_id, body.transcript, body.prompt, llm)
+
+
+@app.post("/v1/audit/form", dependencies=[Depends(require_api_key)])
+def audit_form_endpoint(call_id: str = Form(...), transcript: str = Form(...),
+                        prompt: Optional[str] = Form(None), llm: LLMClient = Depends(get_llm_client)):
+    """Same as /v1/audit but with plain form fields - easy to paste text in /docs."""
+    return _audit(call_id, transcript, prompt, llm)
 
 
 @app.post("/v1/process", dependencies=[Depends(require_api_key)])

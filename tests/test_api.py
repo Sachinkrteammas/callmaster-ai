@@ -51,6 +51,31 @@ def test_audit_endpoint(client, test_schema_files, fake_llm):
     assert fake_llm.calls[0]["user"] == "[0.00s] Agent: Sir good morning sir."
 
 
+def test_audit_with_prompt_skips_schema(client, test_schema_files, fake_llm):
+    fake_llm.replies = ['{"Opening": 1, "SaleDone": 0}']
+    r = client.post("/v1/audit", headers=API_HEADERS,
+                    json={"call_id": "P1", "transcript": "[0.00s] Agent: Hi.", "prompt": "My prompt"})
+    assert r.status_code == 200, r.text
+    assert r.json()["audit"] == {"Opening": 1, "SaleDone": 0}
+    assert fake_llm.calls[0]["system"] == "My prompt"
+    assert fake_llm.calls[0]["schema"] is None
+
+
+def test_audit_form_endpoint(client, test_schema_files, fake_llm):
+    fake_llm.replies = ['{"Opening": 1}']
+    r = client.post("/v1/audit/form", headers=API_HEADERS,
+                    data={"call_id": "P2", "transcript": "[0.00s] Agent: Hi.", "prompt": "My prompt"})
+    assert r.status_code == 200, r.text
+    assert r.json()["audit"] == {"Opening": 1}
+
+
+def test_audit_with_prompt_rejects_non_object(client, test_schema_files, fake_llm):
+    fake_llm.replies = ['[1, 2]', '[1, 2]']
+    r = client.post("/v1/audit", headers=API_HEADERS,
+                    json={"call_id": "P3", "transcript": "x", "prompt": "My prompt"})
+    assert r.status_code == 422
+
+
 def test_audit_endpoint_invalid_json_gives_422(client, test_schema_files, fake_llm):
     fake_llm.replies = ['{"wrong": true}']
     r = client.post("/v1/audit", headers=API_HEADERS, json={"call_id": "T2", "transcript": "x"})

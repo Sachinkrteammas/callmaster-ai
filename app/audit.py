@@ -59,14 +59,24 @@ def build_messages(prompt: str, transcript: str) -> Tuple[str, str]:
 
 
 def run_audit(transcript: str, call_id: str = "", llm: Optional[LLMClient] = None,
-              max_attempts: int = 2) -> dict:
-    """First attempt + one retry. Never fabricates missing values."""
+              max_attempts: int = 2, prompt: Optional[str] = None) -> dict:
+    """First attempt + one retry. Never fabricates missing values.
+
+    If `prompt` is given (sent by the caller), it is used instead of the prompt
+    file and the output only has to be a JSON object - the prompt itself defines
+    the fields. The schema file is also skipped while it is still the placeholder.
+    """
     if not transcript or not transcript.strip():
         raise AuditError("Transcript is empty - nothing to audit")
 
     llm = llm or LLMClient()
-    prompt = load_prompt()
-    schema = load_schema()
+    if prompt and prompt.strip():
+        schema = None
+    else:
+        prompt = load_prompt()
+        schema = load_schema()
+        if is_placeholder_schema(schema):
+            schema = None
     system_msg, user_msg = build_messages(prompt, transcript)
     log.debug("call_id=%s transcript sent to LLM:\n%s", call_id, transcript)
 
@@ -75,7 +85,12 @@ def run_audit(transcript: str, call_id: str = "", llm: Optional[LLMClient] = Non
         raw = llm.chat_json(system_msg, user_msg, schema)  # LLMError propagates (connection/GPU problem)
         try:
             data = parse_json_text(raw)
-            errors = validate_against_schema(data, schema)
+            if schema is not None:
+                errors = validate_against_schema(data, schema)
+            elif not isinstance(data, dict):
+                errors = ["LLM response is not a JSON object"]
+            else:
+                errors = []
         except ValueError as exc:
             errors = [str(exc)]
         if not errors:
