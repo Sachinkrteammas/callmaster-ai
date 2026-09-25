@@ -1,3 +1,6 @@
 # vLLM runs in its OWN virtual environment (.venv-vllm) so its PyTorch/CUDA
 # packages never conflict with faster-whisper.
 vllm==0.8.5
+# vLLM 0.8.5 does not pin these; newer major versions break it.
+transformers==4.51.3
+openai<2
