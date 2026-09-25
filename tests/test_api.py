@@ -14,7 +14,7 @@ def test_api_key_required(client):
     r = client.post("/v1/transcribe", data={"call_id": "A1"}, files=_upload(), headers={"X-API-Key": "wrong"})
     assert r.status_code == 401
     assert client.get("/v1/jobs/A1").status_code == 401
-    assert client.post("/v1/audit", json={"call_id": "A1", "transcript": "x"}).status_code == 401
+    assert client.post("/v1/audit", data={"transcript": "x", "prompt": "p"}).status_code == 401
 
 
 def test_unsafe_call_id_rejected(client):
@@ -43,43 +43,42 @@ def test_transcribe_endpoint(client, fake_stt):
     assert "processing_seconds" in body
 
 
-def test_audit_endpoint(client, test_schema_files, fake_llm):
-    r = client.post("/v1/audit", headers=API_HEADERS,
-                    json={"call_id": "TEST001", "transcript": "[0.00s] Agent: Sir good morning sir."})
-    assert r.status_code == 200, r.text
-    assert r.json()["audit"] == {"greeting_done": "Yes", "summary": "Agent greeted."}
-    assert fake_llm.calls[0]["user"] == "[0.00s] Agent: Sir good morning sir."
-
-
-def test_audit_with_prompt_skips_schema(client, test_schema_files, fake_llm):
+def test_audit_endpoint(client, fake_llm):
     fake_llm.replies = ['{"Opening": 1, "SaleDone": 0}']
     r = client.post("/v1/audit", headers=API_HEADERS,
-                    json={"call_id": "P1", "transcript": "[0.00s] Agent: Hi.", "prompt": "My prompt"})
+                    data={"call_id": "P1", "transcript": "[0.00s] Agent: Hi.", "prompt": "Client prompt"})
     assert r.status_code == 200, r.text
     assert r.json()["audit"] == {"Opening": 1, "SaleDone": 0}
-    assert fake_llm.calls[0]["system"] == "My prompt"
+    assert fake_llm.calls[0]["system"] == "Client prompt"
+    assert fake_llm.calls[0]["user"] == "[0.00s] Agent: Hi."
     assert fake_llm.calls[0]["schema"] is None
 
 
-def test_audit_form_endpoint(client, test_schema_files, fake_llm):
-    fake_llm.replies = ['{"Opening": 1}']
-    r = client.post("/v1/audit/form", headers=API_HEADERS,
-                    data={"call_id": "P2", "transcript": "[0.00s] Agent: Hi.", "prompt": "My prompt"})
+def test_audit_call_id_optional(client, fake_llm):
+    r = client.post("/v1/audit", headers=API_HEADERS, data={"transcript": "x", "prompt": "p"})
     assert r.status_code == 200, r.text
-    assert r.json()["audit"] == {"Opening": 1}
+    assert r.json()["call_id"]
 
 
-def test_audit_with_prompt_rejects_non_object(client, test_schema_files, fake_llm):
-    fake_llm.replies = ['[1, 2]', '[1, 2]']
-    r = client.post("/v1/audit", headers=API_HEADERS,
-                    json={"call_id": "P3", "transcript": "x", "prompt": "My prompt"})
+def test_audit_prompt_required(client, fake_llm):
+    r = client.post("/v1/audit", headers=API_HEADERS, data={"transcript": "x"})
     assert r.status_code == 422
 
 
-def test_audit_endpoint_invalid_json_gives_422(client, test_schema_files, fake_llm):
-    fake_llm.replies = ['{"wrong": true}']
-    r = client.post("/v1/audit", headers=API_HEADERS, json={"call_id": "T2", "transcript": "x"})
+def test_audit_non_object_gives_422(client, fake_llm):
+    fake_llm.replies = ['[1, 2]', '[1, 2]']
+    r = client.post("/v1/audit", headers=API_HEADERS, data={"transcript": "x", "prompt": "p"})
     assert r.status_code == 422 and r.json()["success"] is False
+
+
+def test_process_with_client_prompt(client, fake_stt, fake_llm, test_schema_files):
+    fake_llm.replies = ['{"Opening": 1}']
+    r = client.post("/v1/process", data={"call_id": "CP1", "prompt": "Client prompt"},
+                    files=_upload(), headers=API_HEADERS)
+    assert r.status_code == 200, r.text
+    assert r.json()["audit"] == {"Opening": 1}
+    assert fake_llm.calls[-1]["system"] == "Client prompt"
+    assert fake_llm.calls[-1]["schema"] is None
 
 
 def test_process_end_to_end_saves_result(client, fake_stt, fake_llm, test_schema_files):

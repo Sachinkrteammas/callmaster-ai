@@ -16,7 +16,6 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from redis import Redis
 from rq import Queue, Retry, Worker
 from rq.exceptions import NoSuchJobError
@@ -195,13 +194,13 @@ def transcribe(call_id: str = Form(...), file: UploadFile = File(...), queue: Qu
                                                   "error": "Timed out waiting for transcription"})
 
 
-class AuditRequest(BaseModel):
-    call_id: str
-    transcript: str
-    prompt: Optional[str] = None  # empty = use app/prompts/audit_prompt.txt
-
-
-def _audit(call_id: str, transcript: str, prompt: Optional[str], llm: LLMClient):
+@app.post("/v1/audit", dependencies=[Depends(require_api_key)])
+def audit_endpoint(transcript: str = Form(...), prompt: str = Form(...),
+                   call_id: Optional[str] = Form(None), llm: LLMClient = Depends(get_llm_client)):
+    """Send the call transcript + the client's audit prompt; the model analyses
+    the call following that prompt and returns its JSON. Form fields, so long
+    prompts with quotes can be pasted as-is (no JSON escaping)."""
+    call_id = call_id or uuid.uuid4().hex
     _check_call_id(call_id)
     t0 = time.time()
     try:
@@ -214,29 +213,17 @@ def _audit(call_id: str, transcript: str, prompt: Optional[str], llm: LLMClient)
             "llm_model": settings.llm_model, "processing_seconds": round(time.time() - t0, 2)}
 
 
-@app.post("/v1/audit", dependencies=[Depends(require_api_key)])
-def audit_endpoint(body: AuditRequest, llm: LLMClient = Depends(get_llm_client)):
-    """JSON body: call_id, transcript, optional prompt."""
-    return _audit(body.call_id, body.transcript, body.prompt, llm)
-
-
-@app.post("/v1/audit/form", dependencies=[Depends(require_api_key)])
-def audit_form_endpoint(call_id: str = Form(...), transcript: str = Form(...),
-                        prompt: Optional[str] = Form(None), llm: LLMClient = Depends(get_llm_client)):
-    """Same as /v1/audit but with plain form fields - easy to paste text in /docs."""
-    return _audit(call_id, transcript, prompt, llm)
-
-
 @app.post("/v1/process", dependencies=[Depends(require_api_key)])
 def process(call_id: str = Form(...), file: UploadFile = File(...),
-            webhook_url: Optional[str] = Form(None), queue: Queue = Depends(get_queue)):
+            webhook_url: Optional[str] = Form(None), prompt: Optional[str] = Form(None),
+            queue: Queue = Depends(get_queue)):
     """Full pipeline, waits for the result. If it takes longer than
     SYNC_TIMEOUT_SECONDS, returns 202 and the caller polls /v1/jobs/{call_id}."""
     _check_call_id(call_id)
     _prepare_new_call(call_id, queue)
     path = _save_upload(file, call_id)
     log.info("call_id=%s /v1/process accepted", call_id)
-    job = queue.enqueue("app.pipeline.process_call", call_id, str(path), webhook_url or None,
+    job = queue.enqueue("app.pipeline.process_call", call_id, str(path), webhook_url or None, prompt or None,
                         job_id=call_id, job_timeout=settings.job_timeout,
                         result_ttl=86400, failure_ttl=7 * 86400)
     state = _wait(job, settings.sync_timeout)
@@ -251,12 +238,13 @@ def process(call_id: str = Form(...), file: UploadFile = File(...),
 
 @app.post("/v1/jobs", status_code=202, dependencies=[Depends(require_api_key)])
 def create_job(file: UploadFile = File(...), call_id: Optional[str] = Form(None),
-               webhook_url: Optional[str] = Form(None), queue: Queue = Depends(get_queue)):
+               webhook_url: Optional[str] = Form(None), prompt: Optional[str] = Form(None),
+               queue: Queue = Depends(get_queue)):
     call_id = call_id or uuid.uuid4().hex
     _check_call_id(call_id)
     _prepare_new_call(call_id, queue)
     path = _save_upload(file, call_id)
-    queue.enqueue("app.pipeline.process_call", call_id, str(path), webhook_url or None,
+    queue.enqueue("app.pipeline.process_call", call_id, str(path), webhook_url or None, prompt or None,
                   job_id=call_id, job_timeout=settings.job_timeout,
                   retry=Retry(max=3, interval=RETRY_INTERVALS),
                   result_ttl=86400, failure_ttl=7 * 86400)

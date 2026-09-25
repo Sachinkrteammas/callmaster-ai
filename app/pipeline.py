@@ -100,8 +100,10 @@ def deliver_webhook(url: str, payload: dict) -> dict:
         return {"delivered": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def process_call(call_id: str, audio_path: str, webhook_url: Optional[str] = None) -> dict:
-    """Used by POST /v1/process and POST /v1/jobs."""
+def process_call(call_id: str, audio_path: str, webhook_url: Optional[str] = None,
+                 prompt: Optional[str] = None) -> dict:
+    """Used by POST /v1/process and POST /v1/jobs. `prompt` = the client's audit
+    prompt; empty = use app/prompts/audit_prompt.txt."""
     t0 = time.time()
 
     # If a retry happens after STT succeeded (e.g. LLM was temporarily down),
@@ -119,7 +121,7 @@ def process_call(call_id: str, audio_path: str, webhook_url: Optional[str] = Non
 
     log.info("call_id=%s LLM start", call_id)
     t_llm = time.time()
-    audit_json = run_audit(stt["transcript"], call_id=call_id, llm=get_llm())
+    audit_json = run_audit(stt["transcript"], call_id=call_id, llm=get_llm(), prompt=prompt)
     llm_seconds = round(time.time() - t_llm, 2)
     log.info("call_id=%s LLM end seconds=%.2f", call_id, llm_seconds)
 

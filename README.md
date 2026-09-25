@@ -30,7 +30,7 @@ Start order is always: **Redis → vLLM (wait until ready) → Worker → API**.
 |---|---|
 | `GET /health` | Is everything running? (no key needed) |
 | `POST /v1/transcribe` | Audio → transcript |
-| `POST /v1/audit` | Transcript text → audit JSON |
+| `POST /v1/audit` | Transcript + client prompt → audit JSON |
 | `POST /v1/process` | Audio → transcript → audit JSON (waits for result) |
 | `POST /v1/jobs` | Same, but returns immediately; 3 retries after 30/60/120 s |
 | `GET /v1/jobs/{call_id}` | `queued` / `processing` / `completed` / `failed` + result |
@@ -290,8 +290,7 @@ deactivate
 **13c. Audit only:**
 ```bash
 curl -X POST http://localhost:8080/v1/audit -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"call_id":"TEST001","transcript":"[0.00s] Agent: Sir good morning sir.\n[2.00s] Customer: Hello."}'
+  -F "call_id=TEST001" -F "transcript=<transcript.txt" -F "prompt=<prompt.txt"
 ```
 
 **13d. Full pipeline:**
